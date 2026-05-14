@@ -269,7 +269,7 @@ def build_dispatcher() -> Dispatcher:
         # API возвращает заказы по dateFrom без верхней границы — обрежем сами.
         items = [
             i for i in items
-            if (i.get("date") or "")[:10] <= date_to.isoformat()
+            if date_from.isoformat() <= (i.get("date") or "")[:10] <= date_to.isoformat()
         ]
         summary = summarize_orders(items)
         await status.edit_text(format_orders_text(date_from, date_to, summary))
@@ -301,7 +301,7 @@ def build_dispatcher() -> Dispatcher:
             return
         items = [
             i for i in items
-            if (i.get("date") or "")[:10] <= date_to.isoformat()
+            if date_from.isoformat() <= (i.get("date") or "")[:10] <= date_to.isoformat()
         ]
         summary = summarize_sales(items)
         await status.edit_text(format_sales_text(date_from, date_to, summary))

@@ -51,13 +51,14 @@ async def _get(client: httpx.AsyncClient, path: str, headers, params, max_attemp
 
 
 async def _fetch_paginated(token: str, path: str, date_from: date | datetime) -> list[dict]:
+    """flag=1 — отбор по полю `date`. dateFrom включительно, верхней границы нет."""
     headers = {"Authorization": token}
     cursor = _rfc3339(date_from)
     out: list[dict] = []
     seen_ids: set[str] = set()
     async with httpx.AsyncClient(base_url=WB_STATISTICS_BASE, timeout=120.0) as client:
         while True:
-            page = await _get(client, path, headers, {"dateFrom": cursor, "flag": 0})
+            page = await _get(client, path, headers, {"dateFrom": cursor, "flag": 1})
             if not page:
                 break
             new_items = [
@@ -73,7 +74,7 @@ async def _fetch_paginated(token: str, path: str, date_from: date | datetime) ->
             out.extend(new_items)
             if len(page) < PAGE_SOFT_LIMIT:
                 break
-            cursor = max(p.get("lastChangeDate") or p.get("date") or cursor for p in page)
+            cursor = max(p.get("date") or cursor for p in page)
             await asyncio.sleep(0.5)
     return out
 
@@ -107,9 +108,10 @@ class SalesSummary:
 
 
 def _amount(o: dict) -> float:
-    val = o.get("priceWithDisc")
+    """Что фактически в чеке у покупателя: finishedPrice (после всех скидок включая СПП)."""
+    val = o.get("finishedPrice")
     if val is None:
-        val = o.get("finishedPrice") or o.get("totalPrice") or 0
+        val = o.get("priceWithDisc") or o.get("totalPrice") or 0
     try:
         return float(val)
     except (TypeError, ValueError):
