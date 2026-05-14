@@ -79,9 +79,21 @@ async def _get_with_retries(
             data = resp.json()
             return data if isinstance(data, list) else []
         if resp.status_code in RETRYABLE_STATUSES and attempt < max_attempts:
-            await asyncio.sleep(backoff)
+            wait = _retry_after_seconds(resp) if resp.status_code == 429 else backoff
+            await asyncio.sleep(wait)
             backoff *= 2
             continue
         raise WBApiError(f"WB API {resp.status_code}: {resp.text[:300]}")
 
     return []
+
+
+def _retry_after_seconds(resp: httpx.Response, default: float = 65.0) -> float:
+    """WB throttles reportDetailByPeriod at ~1 req/min; honor Retry-After if present."""
+    raw = resp.headers.get("Retry-After")
+    if not raw:
+        return default
+    try:
+        return max(float(raw), default)
+    except ValueError:
+        return default

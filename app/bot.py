@@ -89,7 +89,14 @@ async def _send_report(message: Message, date_from: date, date_to: date) -> None
     try:
         bundle = await build_report(settings.wb_api_token, date_from, date_to)
     except WBApiError as exc:
-        await status.edit_text(f"Ошибка WB API: {exc}")
+        text = str(exc)
+        if "429" in text:
+            await status.edit_text(
+                "WB API ограничивает этот отчёт до 1 запроса в минуту. "
+                "Подождите ~1 минуту и повторите."
+            )
+        else:
+            await status.edit_text(f"Ошибка WB API: {exc}")
         return
     except Exception as exc:  # noqa: BLE001
         logger.exception("report failed")
