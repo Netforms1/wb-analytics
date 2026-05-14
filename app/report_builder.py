@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from io import BytesIO
 
 import matplotlib
@@ -9,6 +10,23 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 from app.decoder import ReportTotals
+
+# openpyxl запрещает в ячейках управляющие символы XML 1.0.
+# WB присылает в полях штрихкодов/маркировки разделители GS (\x1d), RS (\x1e) и т.п. —
+# их нужно вычистить, иначе writer падает с IllegalCharacterError.
+_ILLEGAL_XLSX_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _sanitize_for_xlsx(df: pd.DataFrame) -> pd.DataFrame:
+    obj_cols = df.select_dtypes(include=["object"]).columns
+    if obj_cols.empty:
+        return df
+    cleaned = df.copy()
+    for col in obj_cols:
+        cleaned[col] = cleaned[col].map(
+            lambda v: _ILLEGAL_XLSX_CHARS.sub("", v) if isinstance(v, str) else v
+        )
+    return cleaned
 
 
 def build_excel(df: pd.DataFrame, totals: ReportTotals) -> bytes:
@@ -25,10 +43,14 @@ def build_excel(df: pd.DataFrame, totals: ReportTotals) -> bytes:
             }
         )
         summary.to_excel(writer, sheet_name="Сводка", index=False)
-        totals.by_money_column.to_excel(writer, sheet_name="Расшифровка статей", index=False)
-        totals.by_operation.to_excel(writer, sheet_name="По операциям", index=False)
-        totals.by_sku.to_excel(writer, sheet_name="По товарам", index=False)
-        df.to_excel(writer, sheet_name="Исходные строки", index=False)
+        _sanitize_for_xlsx(totals.by_money_column).to_excel(
+            writer, sheet_name="Расшифровка статей", index=False
+        )
+        _sanitize_for_xlsx(totals.by_operation).to_excel(
+            writer, sheet_name="По операциям", index=False
+        )
+        _sanitize_for_xlsx(totals.by_sku).to_excel(writer, sheet_name="По товарам", index=False)
+        _sanitize_for_xlsx(df).to_excel(writer, sheet_name="Исходные строки", index=False)
     return buf.getvalue()
 
 
