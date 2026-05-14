@@ -21,7 +21,14 @@ logger = logging.getLogger(__name__)
 # Не пускаем запрос чаще, чем раз в WB_MIN_INTERVAL_SEC, чтобы не накапливать штраф.
 WB_MIN_INTERVAL_SEC = 70.0
 _last_wb_call_at: float = 0.0
-_wb_lock = asyncio.Lock()
+_wb_lock: asyncio.Lock | None = None
+
+
+def _get_wb_lock() -> asyncio.Lock:
+    global _wb_lock
+    if _wb_lock is None:
+        _wb_lock = asyncio.Lock()
+    return _wb_lock
 
 HELP = (
     "Бот расшифровывает финансовый отчёт WB «реализация».\n\n"
@@ -93,7 +100,7 @@ def build_dispatcher() -> Dispatcher:
 
 async def _send_report(message: Message, date_from: date, date_to: date) -> None:
     global _last_wb_call_at
-    async with _wb_lock:
+    async with _get_wb_lock():
         wait_left = WB_MIN_INTERVAL_SEC - (time.monotonic() - _last_wb_call_at)
         if wait_left > 0:
             await message.answer(
