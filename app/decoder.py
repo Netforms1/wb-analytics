@@ -37,6 +37,7 @@ class ReportTotals:
     payout: float
     cogs: float
     profit: float
+    loans_deduction: float
     by_operation: pd.DataFrame
     by_sku: pd.DataFrame
     by_money_column: pd.DataFrame
@@ -63,11 +64,30 @@ def _net_units_sold(df: pd.DataFrame) -> pd.Series:
     return signed.groupby(df["nm_id"]).sum()
 
 
+def _is_loan_row(row: pd.Series) -> bool:
+    """WB удерживает по кредитам отдельной операцией; ловим по словам в названиях."""
+    for col in ("supplier_oper_name", "bonus_type_name", "doc_type_name"):
+        val = row.get(col)
+        if isinstance(val, str) and "кредит" in val.lower():
+            return True
+    return False
+
+
+def _split_loans(df: pd.DataFrame) -> tuple[float, float]:
+    """Returns (loans_deduction, generic_deduction). loans is part of total deduction."""
+    if df.empty or "deduction" not in df.columns:
+        return 0.0, 0.0
+    loan_mask = df.apply(_is_loan_row, axis=1)
+    loan_sum = float(df.loc[loan_mask, "deduction"].sum())
+    other_sum = float(df.loc[~loan_mask, "deduction"].sum())
+    return loan_sum, other_sum
+
+
 def summarize(df: pd.DataFrame, costs: dict[int, float] | None = None) -> ReportTotals:
     costs = costs or {}
     if df.empty:
         empty = pd.DataFrame()
-        return ReportTotals(0.0, 0.0, 0.0, 0.0, 0.0, empty, empty, empty)
+        return ReportTotals(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, empty, empty, empty)
 
     income = float(sum(df[c].sum() for c in INCOME_COLS if c in df.columns))
     expense = float(sum(df[c].sum() for c in EXPENSE_COLS if c in df.columns))
@@ -110,17 +130,39 @@ def summarize(df: pd.DataFrame, costs: dict[int, float] | None = None) -> Report
     cogs_total = float(by_sku["cogs"].sum()) if not by_sku.empty else 0.0
     profit_total = payout - cogs_total
 
+    loans_sum, other_deduction = _split_loans(df)
+
     money_rows = []
     for col in INCOME_COLS + EXPENSE_COLS:
         if col in df.columns:
-            money_rows.append(
-                {
-                    "column": col,
-                    "label": COLUMN_LABELS_RU.get(col, col),
-                    "kind": "приход" if col in INCOME_COLS else "удержание",
-                    "amount": float(df[col].sum()),
-                }
-            )
+            amount = float(df[col].sum())
+            # «Прочие удержания» делим на «по кредитам» и остальное.
+            if col == "deduction":
+                money_rows.append(
+                    {
+                        "column": "deduction_other",
+                        "label": "Прочие удержания (без кредитов)",
+                        "kind": "удержание",
+                        "amount": other_deduction,
+                    }
+                )
+                money_rows.append(
+                    {
+                        "column": "deduction_loan",
+                        "label": "Удержания по кредитам",
+                        "kind": "удержание",
+                        "amount": loans_sum,
+                    }
+                )
+            else:
+                money_rows.append(
+                    {
+                        "column": col,
+                        "label": COLUMN_LABELS_RU.get(col, col),
+                        "kind": "приход" if col in INCOME_COLS else "удержание",
+                        "amount": amount,
+                    }
+                )
     if costs and cogs_total > 0:
         money_rows.append(
             {
@@ -138,6 +180,7 @@ def summarize(df: pd.DataFrame, costs: dict[int, float] | None = None) -> Report
         payout=payout,
         cogs=cogs_total,
         profit=profit_total,
+        loans_deduction=loans_sum,
         by_operation=by_operation,
         by_sku=by_sku,
         by_money_column=by_money_column,

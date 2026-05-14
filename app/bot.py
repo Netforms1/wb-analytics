@@ -360,26 +360,37 @@ def build_dispatcher() -> Dispatcher:
     return dp
 
 
-async def _send_report(message: Message, date_from: date, date_to: date) -> None:
+async def _wait_for_wb_window() -> None:
+    """Block until at least WB_MIN_INTERVAL_SEC since the previous WB call."""
     global _last_wb_call_at
     async with _get_wb_lock():
         wait_left = WB_MIN_INTERVAL_SEC - (time.monotonic() - _last_wb_call_at)
         if wait_left > 0:
-            await message.answer(
-                f"Подождите ещё {int(wait_left) + 1} сек — у WB лимит 1 запрос в минуту."
-            )
-            return
+            await asyncio.sleep(wait_left)
         _last_wb_call_at = time.monotonic()
 
+
+async def _send_report(message: Message, date_from: date, date_to: date) -> None:
     try:
         token = get_wb_token()
     except NoWBTokenError as exc:
         await message.answer(str(exc))
         return
 
-    status = await message.answer("Запрашиваю отчёт у WB, подождите…")
+    status = await message.answer("Готовлю отчёт…")
+
+    async def on_progress(text: str) -> None:
+        try:
+            await status.edit_text(text)
+        except Exception:  # noqa: BLE001
+            pass
+
     try:
-        bundle = await build_report(token, date_from, date_to)
+        bundle = await build_report(
+            token, date_from, date_to,
+            on_progress=on_progress,
+            before_wb_call=_wait_for_wb_window,
+        )
     except WBApiError as exc:
         text = str(exc)
         if "429" in text:
