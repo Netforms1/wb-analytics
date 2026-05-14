@@ -77,13 +77,15 @@ def build_top_sku_chart(totals: ReportTotals, top_n: int = 10) -> bytes:
     data = totals.by_sku.copy()
     if data.empty:
         return b""
+    metric = "profit" if totals.cogs > 0 and "profit" in data.columns else "payout"
+    metric_label = "прибыли" if metric == "profit" else "выплате"
     data = data.head(top_n).iloc[::-1]
     label_col = "sa_name" if "sa_name" in data.columns else data.columns[0]
     labels = data[label_col].astype(str).fillna("—")
 
     fig, ax = plt.subplots(figsize=(9, max(4, 0.5 * len(data))))
-    ax.barh(labels, data["payout"], color="#1f77b4")
-    ax.set_title(f"Топ-{top_n} товаров по выплате, ₽")
+    ax.barh(labels, data[metric], color="#1f77b4")
+    ax.set_title(f"Топ-{top_n} товаров по {metric_label}, ₽")
     ax.set_xlabel("₽")
     fig.tight_layout()
     return _fig_to_png(fig)
