@@ -26,6 +26,7 @@ from app.costs import load_costs, update_costs
 from app.service import build_report, format_summary_text
 from app.wb_catalog import CatalogApiError, fetch_catalog
 from app.wb_client import WBApiError
+from app.wb_token import NoWBTokenError, get_wb_token, has_user_token, save_wb_token
 
 logger = logging.getLogger(__name__)
 
@@ -47,13 +48,14 @@ BTN_WEEK = "📊 За неделю"
 BTN_PERIOD = "📅 За период"
 BTN_CATALOG = "🛒 Каталог + себестоимость"
 BTN_COSTS = "💰 Мои себестоимости"
+BTN_TOKEN = "🔑 WB-токен"
 BTN_HELP = "ℹ️ Справка"
 
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_WEEK), KeyboardButton(text=BTN_PERIOD)],
         [KeyboardButton(text=BTN_CATALOG), KeyboardButton(text=BTN_COSTS)],
-        [KeyboardButton(text=BTN_HELP)],
+        [KeyboardButton(text=BTN_TOKEN), KeyboardButton(text=BTN_HELP)],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -67,13 +69,15 @@ HELP = (
     "📅 За период — указать даты вручную\n"
     "🛒 Каталог + себестоимость — выгрузить Excel-шаблон с товарами; "
     "заполните колонку «Себестоимость» и отправьте файл обратно\n"
-    "💰 Мои себестоимости — показать текущий список\n\n"
+    "💰 Мои себестоимости — показать текущий список\n"
+    "🔑 WB-токен — сохранить ваш JWT WB API (сообщение с токеном удаляется автоматически)\n\n"
     "Лимит WB: 1 запрос в минуту."
 )
 
 
 class ReportStates(StatesGroup):
     waiting_period = State()
+    waiting_token = State()
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -215,14 +219,61 @@ def build_dispatcher() -> Dispatcher:
             return
         await _send_report(message, *parsed)
 
+    @dp.message(F.text == BTN_TOKEN)
+    @dp.message(Command("set_token"))
+    async def on_token_prompt(message: Message, state: FSMContext) -> None:
+        if not _is_allowed(message):
+            return
+        await state.set_state(ReportStates.waiting_token)
+        status = "сохранён" if has_user_token() else "ещё не задан"
+        await message.answer(
+            f"Текущий WB-токен: <b>{status}</b>.\n\n"
+            "Пришлите новый JWT-токен следующим сообщением.\n"
+            "Я сохраню его и сразу удалю ваше сообщение, чтобы токен не остался в истории чата."
+        )
+
+    @dp.message(ReportStates.waiting_token, F.text)
+    async def on_token_received(message: Message, state: FSMContext, bot: Bot) -> None:
+        if not _is_allowed(message):
+            return
+        await state.clear()
+        raw = (message.text or "").strip()
+        # быстрая sanity-проверка: WB-токен — JWT, всегда три части через точку
+        if raw.count(".") != 2 or len(raw) < 50:
+            await message.answer("Это не похоже на WB JWT-токен. Сообщение оставлю в чате.")
+            return
+
+        try:
+            save_wb_token(raw)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("save token failed")
+            await message.answer(f"Не смог сохранить токен: {exc}")
+            return
+
+        try:
+            await bot.delete_message(message.chat.id, message.message_id)
+        except Exception:  # noqa: BLE001
+            await message.answer(
+                "Токен сохранил, но удалить ваше сообщение не получилось. "
+                "Удалите его, пожалуйста, вручную."
+            )
+            return
+
+        await message.answer("✅ WB-токен сохранён. Сообщение с токеном удалил.")
+
     @dp.message(F.text == BTN_CATALOG)
     @dp.message(Command("catalog"))
     async def on_catalog(message: Message) -> None:
         if not _is_allowed(message):
             return
+        try:
+            token = get_wb_token()
+        except NoWBTokenError as exc:
+            await message.answer(str(exc))
+            return
         status = await message.answer("Скачиваю каталог из WB…")
         try:
-            catalog = await fetch_catalog(settings.wb_api_token)
+            catalog = await fetch_catalog(token)
         except CatalogApiError as exc:
             await status.edit_text(f"Ошибка WB API: {exc}")
             return
@@ -320,9 +371,15 @@ async def _send_report(message: Message, date_from: date, date_to: date) -> None
             return
         _last_wb_call_at = time.monotonic()
 
+    try:
+        token = get_wb_token()
+    except NoWBTokenError as exc:
+        await message.answer(str(exc))
+        return
+
     status = await message.answer("Запрашиваю отчёт у WB, подождите…")
     try:
-        bundle = await build_report(settings.wb_api_token, date_from, date_to)
+        bundle = await build_report(token, date_from, date_to)
     except WBApiError as exc:
         text = str(exc)
         if "429" in text:
