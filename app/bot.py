@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import date, datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
@@ -15,6 +16,12 @@ from app.service import build_report, format_summary_text
 from app.wb_client import WBApiError
 
 logger = logging.getLogger(__name__)
+
+# WB лимитит reportDetailByPeriod ~1 req/min на токен и продлевает кулдаун при нарушениях.
+# Не пускаем запрос чаще, чем раз в WB_MIN_INTERVAL_SEC, чтобы не накапливать штраф.
+WB_MIN_INTERVAL_SEC = 70.0
+_last_wb_call_at: float = 0.0
+_wb_lock = asyncio.Lock()
 
 HELP = (
     "Бот расшифровывает финансовый отчёт WB «реализация».\n\n"
@@ -85,6 +92,16 @@ def build_dispatcher() -> Dispatcher:
 
 
 async def _send_report(message: Message, date_from: date, date_to: date) -> None:
+    global _last_wb_call_at
+    async with _wb_lock:
+        wait_left = WB_MIN_INTERVAL_SEC - (time.monotonic() - _last_wb_call_at)
+        if wait_left > 0:
+            await message.answer(
+                f"Подождите ещё {int(wait_left) + 1} сек — у WB лимит 1 запрос в минуту."
+            )
+            return
+        _last_wb_call_at = time.monotonic()
+
     status = await message.answer("Запрашиваю отчёт у WB, подождите…")
     try:
         bundle = await build_report(settings.wb_api_token, date_from, date_to)
