@@ -26,26 +26,46 @@ from app.costs import load_costs, update_costs
 from app.service import build_report, format_summary_text
 from app.wb_catalog import CatalogApiError, fetch_catalog
 from app.wb_client import WBApiError
+from app.wb_orders import (
+    OrdersApiError,
+    fetch_orders,
+    fetch_sales,
+    format_orders_text,
+    format_sales_text,
+    summarize_orders,
+    summarize_sales,
+)
 from app.wb_token import NoWBTokenError, get_wb_token, has_user_token, save_wb_token
 
 logger = logging.getLogger(__name__)
 
 # WB лимитит reportDetailByPeriod ~1 req/min на токен и продлевает кулдаун при нарушениях.
 WB_MIN_INTERVAL_SEC = 70.0
-_last_wb_call_at: float = 0.0
-_wb_lock: asyncio.Lock | None = None
+# Отдельные таймштампы и локи на endpoint, лимиты у них независимые.
+_last_call_at: dict[str, float] = {}
+_locks: dict[str, asyncio.Lock] = {}
 
 
-def _get_wb_lock() -> asyncio.Lock:
-    global _wb_lock
-    if _wb_lock is None:
-        _wb_lock = asyncio.Lock()
-    return _wb_lock
+def _get_lock(endpoint: str) -> asyncio.Lock:
+    if endpoint not in _locks:
+        _locks[endpoint] = asyncio.Lock()
+    return _locks[endpoint]
+
+
+async def _wait_for_window(endpoint: str) -> None:
+    async with _get_lock(endpoint):
+        last = _last_call_at.get(endpoint, 0.0)
+        wait_left = WB_MIN_INTERVAL_SEC - (time.monotonic() - last)
+        if wait_left > 0:
+            await asyncio.sleep(wait_left)
+        _last_call_at[endpoint] = time.monotonic()
 
 
 # ── UI: bottom reply keyboard ────────────────────────────────────────────────
-BTN_WEEK = "📊 За неделю"
-BTN_PERIOD = "📅 За период"
+BTN_WEEK = "📊 Реализация за неделю"
+BTN_PERIOD = "📅 Реализация за период"
+BTN_ORDERS = "📦 Заказы за неделю"
+BTN_SALES = "✅ Выкупы за неделю"
 BTN_CATALOG = "🛒 Каталог + себестоимость"
 BTN_COSTS = "💰 Мои себестоимости"
 BTN_TOKEN = "🔑 WB-токен"
@@ -54,6 +74,7 @@ BTN_HELP = "ℹ️ Справка"
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_WEEK), KeyboardButton(text=BTN_PERIOD)],
+        [KeyboardButton(text=BTN_ORDERS), KeyboardButton(text=BTN_SALES)],
         [KeyboardButton(text=BTN_CATALOG), KeyboardButton(text=BTN_COSTS)],
         [KeyboardButton(text=BTN_TOKEN), KeyboardButton(text=BTN_HELP)],
     ],
@@ -62,16 +83,17 @@ MAIN_KB = ReplyKeyboardMarkup(
 )
 
 HELP = (
-    "Бот расшифровывает финансовый отчёт WB «реализация» "
-    "и считает прибыль с учётом вашей себестоимости.\n\n"
+    "Бот расшифровывает финансовые данные WB и считает прибыль "
+    "с учётом вашей себестоимости.\n\n"
     "Меню снизу:\n"
-    "📊 За неделю — отчёт за последние 7 дней\n"
-    "📅 За период — указать даты вручную\n"
-    "🛒 Каталог + себестоимость — выгрузить Excel-шаблон с товарами; "
-    "заполните колонку «Себестоимость» и отправьте файл обратно\n"
+    "📊 Реализация за неделю — недельный отчёт о реализации\n"
+    "📅 Реализация за период — указать даты вручную\n"
+    "📦 Заказы за неделю — все заказы (включая отменённые)\n"
+    "✅ Выкупы за неделю — фактические выкупы и возвраты\n"
+    "🛒 Каталог + себестоимость — Excel-шаблон с товарами; заполните колонку «Себестоимость» и отправьте обратно\n"
     "💰 Мои себестоимости — показать текущий список\n"
-    "🔑 WB-токен — сохранить ваш JWT WB API (сообщение с токеном удаляется автоматически)\n\n"
-    "Лимит WB: 1 запрос в минуту."
+    "🔑 WB-токен — сохранить ваш JWT WB API (сообщение удаляется автоматически)\n\n"
+    "Лимит WB: ~1 запрос в минуту на каждый эндпоинт."
 )
 
 
@@ -219,6 +241,71 @@ def build_dispatcher() -> Dispatcher:
             return
         await _send_report(message, *parsed)
 
+    @dp.message(F.text == BTN_ORDERS)
+    @dp.message(Command("orders"))
+    async def on_orders(message: Message) -> None:
+        if not _is_allowed(message):
+            return
+        try:
+            token = get_wb_token()
+        except NoWBTokenError as exc:
+            await message.answer(str(exc))
+            return
+        date_to = date.today()
+        date_from = date_to - timedelta(days=7)
+        status = await message.answer("Тяну заказы из WB (учитываю лимит ~1 req/min)…")
+        await _wait_for_window("orders")
+        try:
+            items = await fetch_orders(token, date_from)
+        except OrdersApiError as exc:
+            text = str(exc)
+            if "429" in text:
+                await status.edit_text(
+                    "WB ограничивает /orders до 1 запроса в минуту. Подождите ~1 мин и повторите."
+                )
+            else:
+                await status.edit_text(f"Ошибка WB API: {exc}")
+            return
+        # API возвращает заказы по dateFrom без верхней границы — обрежем сами.
+        items = [
+            i for i in items
+            if (i.get("date") or "")[:10] <= date_to.isoformat()
+        ]
+        summary = summarize_orders(items)
+        await status.edit_text(format_orders_text(date_from, date_to, summary))
+
+    @dp.message(F.text == BTN_SALES)
+    @dp.message(Command("sales"))
+    async def on_sales(message: Message) -> None:
+        if not _is_allowed(message):
+            return
+        try:
+            token = get_wb_token()
+        except NoWBTokenError as exc:
+            await message.answer(str(exc))
+            return
+        date_to = date.today()
+        date_from = date_to - timedelta(days=7)
+        status = await message.answer("Тяну выкупы из WB (учитываю лимит ~1 req/min)…")
+        await _wait_for_window("sales")
+        try:
+            items = await fetch_sales(token, date_from)
+        except OrdersApiError as exc:
+            text = str(exc)
+            if "429" in text:
+                await status.edit_text(
+                    "WB ограничивает /sales до 1 запроса в минуту. Подождите ~1 мин и повторите."
+                )
+            else:
+                await status.edit_text(f"Ошибка WB API: {exc}")
+            return
+        items = [
+            i for i in items
+            if (i.get("date") or "")[:10] <= date_to.isoformat()
+        ]
+        summary = summarize_sales(items)
+        await status.edit_text(format_sales_text(date_from, date_to, summary))
+
     @dp.message(F.text == BTN_TOKEN)
     @dp.message(Command("set_token"))
     async def on_token_prompt(message: Message, state: FSMContext) -> None:
@@ -361,13 +448,7 @@ def build_dispatcher() -> Dispatcher:
 
 
 async def _wait_for_wb_window() -> None:
-    """Block until at least WB_MIN_INTERVAL_SEC since the previous WB call."""
-    global _last_wb_call_at
-    async with _get_wb_lock():
-        wait_left = WB_MIN_INTERVAL_SEC - (time.monotonic() - _last_wb_call_at)
-        if wait_left > 0:
-            await asyncio.sleep(wait_left)
-        _last_wb_call_at = time.monotonic()
+    await _wait_for_window("realization")
 
 
 async def _send_report(message: Message, date_from: date, date_to: date) -> None:
