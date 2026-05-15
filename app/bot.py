@@ -74,6 +74,7 @@ async def _wait_for_window(endpoint: str) -> None:
 
 # ── UI: bottom reply keyboard ────────────────────────────────────────────────
 BTN_WEEK = "📊 Фин-отчёты"
+BTN_FETCH_WB = "🔄 Тянуть фин-отчёты из WB"
 BTN_PERIOD = "📅 Реализация за период"
 BTN_ORDERS = "📦 Заказы за неделю"
 BTN_SALES = "✅ Выкупы за неделю"
@@ -84,7 +85,8 @@ BTN_HELP = "ℹ️ Справка"
 
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text=BTN_WEEK), KeyboardButton(text=BTN_PERIOD)],
+        [KeyboardButton(text=BTN_WEEK), KeyboardButton(text=BTN_FETCH_WB)],
+        [KeyboardButton(text=BTN_PERIOD)],
         [KeyboardButton(text=BTN_ORDERS), KeyboardButton(text=BTN_SALES)],
         [KeyboardButton(text=BTN_CATALOG), KeyboardButton(text=BTN_COSTS)],
         [KeyboardButton(text=BTN_TOKEN), KeyboardButton(text=BTN_HELP)],
@@ -97,8 +99,9 @@ HELP = (
     "Бот расшифровывает финансовые данные WB и считает прибыль "
     "с учётом вашей себестоимости.\n\n"
     "Меню снизу:\n"
-    "📊 Фин-отчёты — список фин-отчётов WB (из API или загруженных вами), выбираете нужный\n"
-    "📤 Загрузить фин-отчёт Excel — отправьте мне xlsx из ЛК WB документом, я добавлю его в список\n"
+    "📊 Фин-отчёты — список уже загруженных фин-отчётов (WB API сам не дёргает)\n"
+    "🔄 Тянуть фин-отчёты из WB — явный запрос в API за последние 35 дней (учитывает лимит)\n"
+    "📤 Загрузить фин-отчёт Excel — пришлите xlsx из ЛК WB документом, я добавлю его в список\n"
     "📅 Реализация за период — указать даты вручную\n"
     "📦 Заказы за неделю — все заказы (включая отменённые)\n"
     "✅ Выкупы за неделю — фактические выкупы и возвраты\n"
@@ -219,20 +222,28 @@ def build_dispatcher() -> Dispatcher:
 
     @dp.message(F.text == BTN_WEEK)
     @dp.message(Command("reports"))
-    @dp.message(Command("last_week"))
     async def on_reports_list(message: Message, state: FSMContext) -> None:
         if not _is_allowed(message):
             return
         await state.clear()
-        await _show_reports_list(message, force_refresh=False)
+        await _show_reports_list(message)
+
+    @dp.message(F.text == BTN_FETCH_WB)
+    @dp.message(Command("fetch_wb"))
+    @dp.message(Command("last_week"))
+    async def on_fetch_wb(message: Message, state: FSMContext) -> None:
+        if not _is_allowed(message):
+            return
+        await state.clear()
+        await _refresh_reports_from_wb(message)
 
     @dp.callback_query(F.data == "rpt:refresh")
     async def on_reports_refresh(call: CallbackQuery) -> None:
         if call.from_user and not _is_allowed_user(call.from_user.id):
             await call.answer("Нет доступа", show_alert=False)
             return
-        await call.answer("Обновляю…")
-        await _show_reports_list(call.message, force_refresh=True)
+        await call.answer("Обновляю из WB…")
+        await _refresh_reports_from_wb(call.message)
 
     @dp.callback_query(F.data.startswith("rpt:"))
     async def on_report_selected(call: CallbackQuery) -> None:
@@ -618,38 +629,52 @@ def _reports_keyboard(items: list[ReportMeta]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def _show_reports_list(message: Message, *, force_refresh: bool) -> None:
+async def _show_reports_list(message: Message) -> None:
+    """Только показывает локальный индекс. В WB не ходит."""
     items = list_reports_sorted()
-    if not items or force_refresh:
-        try:
-            token = get_wb_token()
-        except NoWBTokenError as exc:
-            await message.answer(str(exc))
-            return
-        status = await message.answer(
-            "Тяну список фин-отчётов за 35 дней из WB (учитываю лимит ~1 req/min)…"
+    if not items:
+        await message.answer(
+            "Список фин-отчётов пуст.\n\n"
+            "Загрузите xlsx из ЛК WB документом — или нажмите "
+            "«🔄 Тянуть фин-отчёты из WB», если хотите взять их через API."
         )
-        try:
-            await refresh_reports_index(token, before_wb_call=_wait_for_wb_window)
-        except WBApiError as exc:
-            text = str(exc)
-            if "429" in text:
-                await status.edit_text(
-                    "WB API ограничивает реализационный отчёт до 1 запроса в минуту. "
-                    "Подождите и попробуйте ещё раз."
-                )
-            else:
-                await status.edit_text(f"Ошибка WB API: {exc}")
-            return
-        items = list_reports_sorted()
-        if not items:
-            await status.edit_text("За последние 35 дней WB не вернул фин-отчётов.")
-            return
-        await status.delete()
-
+        return
     await message.answer(
-        f"<b>Доступные фин-отчёты ({len(items)}):</b>\nНажмите на нужный, чтобы получить расшифровку.",
+        f"<b>Доступные фин-отчёты ({len(items)}):</b>\n"
+        "Нажмите на нужный, чтобы получить расшифровку.",
         reply_markup=_reports_keyboard(items),
+    )
+
+
+async def _refresh_reports_from_wb(message: Message) -> None:
+    """Идёт в WB за последние 35 дней и обновляет индекс."""
+    try:
+        token = get_wb_token()
+    except NoWBTokenError as exc:
+        await message.answer(str(exc))
+        return
+    status = await message.answer(
+        "Тяну список фин-отчётов за 35 дней из WB (учитываю лимит ~1 req/min)…"
+    )
+    try:
+        await refresh_reports_index(token, before_wb_call=_wait_for_wb_window)
+    except WBApiError as exc:
+        text = str(exc)
+        if "429" in text:
+            await status.edit_text(
+                "WB API ограничивает реализационный отчёт до 1 запроса в минуту. "
+                "Подождите и попробуйте ещё раз."
+            )
+        else:
+            await status.edit_text(f"Ошибка WB API: {exc}")
+        return
+    items = list_reports_sorted()
+    if not items:
+        await status.edit_text("За последние 35 дней WB не вернул фин-отчётов.")
+        return
+    await status.edit_text(
+        f"Обновил список. Сейчас в индексе: <b>{len(items)}</b>. "
+        "Откройте «📊 Фин-отчёты»."
     )
 
 

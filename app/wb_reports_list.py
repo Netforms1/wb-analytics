@@ -57,9 +57,17 @@ def _build_index(rows: list[dict]) -> dict:
     by_id: dict[str, dict] = {}
     for r in rows:
         rid = r.get("realizationreport_id")
-        if rid is None:
-            continue
-        rid = str(rid)
+        if rid is None or str(rid) in ("", "nan", "None"):
+            # Файл без номера отчёта — синтезируем id из периода, чтобы строки сгруппировались.
+            df_ = (r.get("date_from") or "")[:10] or "unknown"
+            dt_ = (r.get("date_to") or "")[:10] or "unknown"
+            rid = f"excel_{df_}_{dt_}"
+        else:
+            # реальный id обычно number; нормализуем к строке без хвоста .0
+            rid_s = str(rid)
+            if rid_s.endswith(".0"):
+                rid_s = rid_s[:-2]
+            rid = rid_s
         bucket = by_id.setdefault(
             rid,
             {
