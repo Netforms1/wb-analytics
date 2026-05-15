@@ -55,7 +55,8 @@ def to_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
 
 def _net_units_sold(df: pd.DataFrame) -> pd.Series:
     """Net units = sales - returns, indexed by nm_id."""
-    if "supplier_oper_name" not in df.columns or "nm_id" not in df.columns:
+    needed = {"supplier_oper_name", "nm_id", "quantity"}
+    if not needed.issubset(df.columns):
         return pd.Series(dtype=float)
     sign = df["supplier_oper_name"].map(
         lambda x: 1 if x == "Продажа" else (-1 if x == "Возврат" else 0)
@@ -93,42 +94,55 @@ def summarize(df: pd.DataFrame, costs: dict[int, float] | None = None) -> Report
     expense = float(sum(df[c].sum() for c in EXPENSE_COLS if c in df.columns))
     payout = income - expense
 
-    by_operation = (
-        df.groupby("supplier_oper_name", dropna=False)
-        .agg(
-            quantity=("quantity", "sum"),
-            retail_amount=("retail_amount", "sum"),
-            ppvz_for_pay=("ppvz_for_pay", "sum"),
+    op_agg: dict = {}
+    for c in ("quantity", "retail_amount", "ppvz_for_pay"):
+        if c in df.columns:
+            op_agg[c] = (c, "sum")
+    if "supplier_oper_name" in df.columns and op_agg:
+        sort_by = "ppvz_for_pay" if "ppvz_for_pay" in op_agg else next(iter(op_agg))
+        by_operation = (
+            df.groupby("supplier_oper_name", dropna=False)
+            .agg(**op_agg)
+            .reset_index()
+            .sort_values(sort_by, ascending=False)
         )
-        .reset_index()
-        .sort_values("ppvz_for_pay", ascending=False)
-    )
+    else:
+        by_operation = pd.DataFrame()
 
     sku_key_cols = [c for c in ("nm_id", "sa_name", "subject_name", "brand_name") if c in df.columns]
     agg_cols = {c: (c, "sum") for c in INCOME_COLS + EXPENSE_COLS if c in df.columns}
-    agg_cols["quantity"] = ("quantity", "sum")
-    agg_cols["retail_amount"] = ("retail_amount", "sum")
-    by_sku = df.groupby(sku_key_cols, dropna=False).agg(**agg_cols).reset_index()
-    by_sku["payout"] = sum(by_sku[c] for c in INCOME_COLS if c in by_sku.columns) - sum(
-        by_sku[c] for c in EXPENSE_COLS if c in by_sku.columns
-    )
-
-    net_units = _net_units_sold(df)
-    if "nm_id" in by_sku.columns:
-        by_sku["units_sold"] = by_sku["nm_id"].map(net_units).fillna(0).astype(int)
-        by_sku["cost"] = by_sku["nm_id"].map(lambda nm: costs.get(int(nm)) if pd.notna(nm) else None)
-        by_sku["cogs"] = (by_sku["units_sold"] * by_sku["cost"].fillna(0)).astype(float)
-        by_sku["profit"] = by_sku["payout"] - by_sku["cogs"]
+    for c in ("quantity", "retail_amount"):
+        if c in df.columns:
+            agg_cols[c] = (c, "sum")
+    if not sku_key_cols or not agg_cols:
+        by_sku = pd.DataFrame()
     else:
-        by_sku["units_sold"] = 0
-        by_sku["cost"] = None
-        by_sku["cogs"] = 0.0
-        by_sku["profit"] = by_sku["payout"]
+        by_sku = df.groupby(sku_key_cols, dropna=False).agg(**agg_cols).reset_index()
+    if by_sku.empty:
+        cogs_total = 0.0
+        profit_total = payout
+    else:
+        by_sku["payout"] = sum(by_sku[c] for c in INCOME_COLS if c in by_sku.columns) - sum(
+            by_sku[c] for c in EXPENSE_COLS if c in by_sku.columns
+        )
 
-    by_sku = by_sku.sort_values("profit" if costs else "payout", ascending=False)
+        net_units = _net_units_sold(df)
+        if "nm_id" in by_sku.columns:
+            by_sku["units_sold"] = by_sku["nm_id"].map(net_units).fillna(0).astype(int)
+            by_sku["cost"] = by_sku["nm_id"].map(
+                lambda nm: costs.get(int(nm)) if pd.notna(nm) else None
+            )
+            by_sku["cogs"] = (by_sku["units_sold"] * by_sku["cost"].fillna(0)).astype(float)
+            by_sku["profit"] = by_sku["payout"] - by_sku["cogs"]
+        else:
+            by_sku["units_sold"] = 0
+            by_sku["cost"] = None
+            by_sku["cogs"] = 0.0
+            by_sku["profit"] = by_sku["payout"]
 
-    cogs_total = float(by_sku["cogs"].sum()) if not by_sku.empty else 0.0
-    profit_total = payout - cogs_total
+        by_sku = by_sku.sort_values("profit" if costs else "payout", ascending=False)
+        cogs_total = float(by_sku["cogs"].sum())
+        profit_total = payout - cogs_total
 
     loans_sum, other_deduction = _split_loans(df)
 
