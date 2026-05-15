@@ -27,10 +27,12 @@ from aiogram.types import (
 from app.config import settings
 from app.costs import load_costs, update_costs
 from app.service import build_bundle_from_rows, build_report, format_summary_text
+from app.wb_excel import parse_wb_excel
 from app.wb_reports_list import (
     ReportMeta,
     get_report_rows,
     list_reports_sorted,
+    merge_rows_into_index,
     refresh_reports_index,
 )
 from app.wb_catalog import CatalogApiError, fetch_catalog
@@ -95,7 +97,8 @@ HELP = (
     "Бот расшифровывает финансовые данные WB и считает прибыль "
     "с учётом вашей себестоимости.\n\n"
     "Меню снизу:\n"
-    "📊 Фин-отчёты — список опубликованных WB фин-отчётов, выбираете нужный\n"
+    "📊 Фин-отчёты — список фин-отчётов WB (из API или загруженных вами), выбираете нужный\n"
+    "📤 Загрузить фин-отчёт Excel — отправьте мне xlsx из ЛК WB документом, я добавлю его в список\n"
     "📅 Реализация за период — указать даты вручную\n"
     "📦 Заказы за неделю — все заказы (включая отменённые)\n"
     "✅ Выкупы за неделю — фактические выкупы и возвраты\n"
@@ -448,30 +451,63 @@ def build_dispatcher() -> Dispatcher:
         doc = message.document
         name = (doc.file_name or "").lower()
         if not (name.endswith(".xlsx") or name.endswith(".csv")):
-            await message.answer("Жду Excel (.xlsx) или CSV с колонками nm_id и «Себестоимость».")
+            await message.answer("Жду Excel (.xlsx) или CSV.")
             return
 
         buf = BytesIO()
         await bot.download(doc, destination=buf)
+        content = buf.getvalue()
+
+        # 1) Попытка распарсить как файл себестоимостей (есть колонка «Себестоимость»).
         try:
-            updates = _parse_costs_excel(buf.getvalue())
+            cost_updates = _parse_costs_excel(content)
+        except ValueError:
+            cost_updates = None
+        except Exception:  # noqa: BLE001
+            cost_updates = None
+
+        if cost_updates:
+            added, changed = update_costs(cost_updates)
+            await message.answer(
+                f"Загружено себестоимостей: <b>{len(cost_updates)}</b> "
+                f"(новых: {added}, изменено: {changed})."
+            )
+            return
+
+        # 2) Иначе пробуем как реализационный отчёт WB (русские шапки).
+        status = await message.answer("Разбираю WB-отчёт из Excel…")
+        try:
+            rows = parse_wb_excel(content)
         except ValueError as exc:
-            await message.answer(str(exc))
+            await status.edit_text(
+                "Не понял формат файла. Если это файл с себестоимостью — "
+                "убедитесь, что есть колонки nm_id и «Себестоимость». "
+                f"Если реализационный отчёт WB: {exc}"
+            )
             return
         except Exception as exc:  # noqa: BLE001
-            logger.exception("costs upload failed")
-            await message.answer(f"Не смог разобрать файл: {exc}")
+            logger.exception("wb report upload failed")
+            await status.edit_text(f"Не смог разобрать файл: {exc}")
             return
 
-        if not updates:
-            await message.answer("В файле не нашёл ни одной строки с заполненной себестоимостью.")
+        if not rows:
+            await status.edit_text("В файле не нашёл строк с данными.")
             return
 
-        added, changed = update_costs(updates)
-        await message.answer(
-            f"Готово. Загружено позиций: <b>{len(updates)}</b> "
-            f"(новых: {added}, изменено: {changed})."
-        )
+        added_groups = merge_rows_into_index(rows)
+        meta_after = {m.id: m for m in list_reports_sorted()}
+        lines = [f"<b>Загружено из Excel:</b> {len(rows)} строк."]
+        for rid, count in added_groups.items():
+            m = meta_after.get(rid)
+            if m:
+                lines.append(
+                    f"  • №{m.id} · {m.date_from} — {m.date_to} · +{count} новых строк"
+                )
+            else:
+                lines.append(f"  • №{rid} · +{count} строк")
+        lines.append("")
+        lines.append("Нажмите «📊 Фин-отчёты», чтобы выбрать отчёт и получить расшифровку.")
+        await status.edit_text("\n".join(lines))
 
     @dp.message(F.text)
     async def fallback(message: Message, state: FSMContext) -> None:

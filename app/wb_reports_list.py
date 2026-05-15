@@ -116,3 +116,30 @@ def list_reports_sorted() -> list[ReportMeta]:
 
 def get_report_rows(report_id: str) -> list[dict]:
     return _load_index().get(str(report_id), {}).get("rows", [])
+
+
+def merge_rows_into_index(rows: list[dict]) -> dict[str, int]:
+    """Сливаем строки в индекс. Возвращаем {report_id: сколько новых строк добавлено}."""
+    if not rows:
+        return {}
+    existing = _load_index()
+    incoming = _build_index(rows)
+    added: dict[str, int] = {}
+    for rid, meta in incoming.items():
+        if rid in existing:
+            seen = {r.get("rrd_id") for r in existing[rid].get("rows", []) if r.get("rrd_id")}
+            new_ones = [
+                r for r in meta["rows"]
+                if r.get("rrd_id") is None or r.get("rrd_id") not in seen
+            ]
+            existing[rid]["rows"].extend(new_ones)
+            if not existing[rid].get("date_from") and meta.get("date_from"):
+                existing[rid]["date_from"] = meta["date_from"]
+            if not existing[rid].get("date_to") and meta.get("date_to"):
+                existing[rid]["date_to"] = meta["date_to"]
+            added[rid] = len(new_ones)
+        else:
+            existing[rid] = meta
+            added[rid] = len(meta.get("rows", []))
+    _save_index(existing)
+    return added
