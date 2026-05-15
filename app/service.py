@@ -103,6 +103,33 @@ async def build_report(
     )
 
 
+def build_bundle_from_rows(
+    rows: list[dict],
+    *,
+    period: tuple[date, date],
+    previous_rows: list[dict] | None = None,
+    previous_period: tuple[date, date] | None = None,
+) -> ReportBundle:
+    """Готовый бандл без запросов в WB — для уже скачанных данных (по report_id)."""
+    costs = load_costs()
+    df = to_dataframe(rows)
+    totals = summarize(df, costs=costs)
+    prev_totals = (
+        summarize(to_dataframe(previous_rows), costs=costs) if previous_rows else None
+    )
+    return ReportBundle(
+        rows_count=len(df),
+        totals=totals,
+        previous=prev_totals,
+        period=period,
+        previous_period=previous_period if prev_totals else None,
+        excel=build_excel(df, totals, previous=prev_totals),
+        chart_breakdown_png=build_money_breakdown_chart(totals),
+        chart_top_sku_png=build_top_sku_chart(totals),
+        has_costs=bool(costs),
+    )
+
+
 def _fmt_delta(curr: float, prev: float | None, *, higher_is_better: bool) -> str:
     if prev is None:
         return ""

@@ -16,6 +16,9 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -23,7 +26,13 @@ from aiogram.types import (
 
 from app.config import settings
 from app.costs import load_costs, update_costs
-from app.service import build_report, format_summary_text
+from app.service import build_bundle_from_rows, build_report, format_summary_text
+from app.wb_reports_list import (
+    ReportMeta,
+    get_report_rows,
+    list_reports_sorted,
+    refresh_reports_index,
+)
 from app.wb_catalog import CatalogApiError, fetch_catalog
 from app.wb_client import WBApiError
 from app.wb_orders import (
@@ -62,7 +71,7 @@ async def _wait_for_window(endpoint: str) -> None:
 
 
 # ── UI: bottom reply keyboard ────────────────────────────────────────────────
-BTN_WEEK = "📊 Реализация за неделю"
+BTN_WEEK = "📊 Фин-отчёты"
 BTN_PERIOD = "📅 Реализация за период"
 BTN_ORDERS = "📦 Заказы за неделю"
 BTN_SALES = "✅ Выкупы за неделю"
@@ -86,7 +95,7 @@ HELP = (
     "Бот расшифровывает финансовые данные WB и считает прибыль "
     "с учётом вашей себестоимости.\n\n"
     "Меню снизу:\n"
-    "📊 Реализация за неделю — недельный отчёт о реализации\n"
+    "📊 Фин-отчёты — список опубликованных WB фин-отчётов, выбираете нужный\n"
     "📅 Реализация за период — указать даты вручную\n"
     "📦 Заказы за неделю — все заказы (включая отменённые)\n"
     "✅ Выкупы за неделю — фактические выкупы и возвраты\n"
@@ -120,6 +129,13 @@ def _is_allowed(message: Message) -> bool:
     if not allowed:
         return True
     return message.from_user is not None and message.from_user.id in allowed
+
+
+def _is_allowed_user(user_id: int) -> bool:
+    allowed = settings.allowed_user_ids
+    if not allowed:
+        return True
+    return user_id in allowed
 
 
 def _catalog_to_excel(catalog: list[dict], existing_costs: dict[int, float]) -> bytes:
@@ -199,14 +215,30 @@ def build_dispatcher() -> Dispatcher:
         await message.answer(HELP, reply_markup=MAIN_KB)
 
     @dp.message(F.text == BTN_WEEK)
+    @dp.message(Command("reports"))
     @dp.message(Command("last_week"))
-    async def on_week(message: Message, state: FSMContext) -> None:
+    async def on_reports_list(message: Message, state: FSMContext) -> None:
         if not _is_allowed(message):
             return
         await state.clear()
-        date_to = date.today()
-        date_from = date_to - timedelta(days=7)
-        await _send_report(message, date_from, date_to)
+        await _show_reports_list(message, force_refresh=False)
+
+    @dp.callback_query(F.data == "rpt:refresh")
+    async def on_reports_refresh(call: CallbackQuery) -> None:
+        if call.from_user and not _is_allowed_user(call.from_user.id):
+            await call.answer("Нет доступа", show_alert=False)
+            return
+        await call.answer("Обновляю…")
+        await _show_reports_list(call.message, force_refresh=True)
+
+    @dp.callback_query(F.data.startswith("rpt:"))
+    async def on_report_selected(call: CallbackQuery) -> None:
+        if call.from_user and not _is_allowed_user(call.from_user.id):
+            await call.answer("Нет доступа", show_alert=False)
+            return
+        report_id = call.data.split(":", 1)[1]
+        await call.answer(f"Готовлю отчёт №{report_id}…")
+        await _send_report_by_id(call.message, report_id)
 
     @dp.message(F.text == BTN_PERIOD)
     async def on_period_prompt(message: Message, state: FSMContext) -> None:
@@ -251,7 +283,9 @@ def build_dispatcher() -> Dispatcher:
         except NoWBTokenError as exc:
             await message.answer(str(exc))
             return
-        date_to = date.today()
+        # Сдвиг на день назад: WB API публикует заказы/выкупы с задержкой
+        # на ~1 день, поэтому полным считаем период «вчера и неделя до».
+        date_to = date.today() - timedelta(days=1)
         date_from = date_to - timedelta(days=7)
         status = await message.answer("Тяну заказы из WB (учитываю лимит ~1 req/min)…")
         await _wait_for_window("orders")
@@ -284,7 +318,9 @@ def build_dispatcher() -> Dispatcher:
         except NoWBTokenError as exc:
             await message.answer(str(exc))
             return
-        date_to = date.today()
+        # Сдвиг на день назад: WB API публикует заказы/выкупы с задержкой
+        # на ~1 день, поэтому полным считаем период «вчера и неделя до».
+        date_to = date.today() - timedelta(days=1)
         date_from = date_to - timedelta(days=7)
         status = await message.answer("Тяну выкупы из WB (учитываю лимит ~1 req/min)…")
         await _wait_for_window("sales")
@@ -508,6 +544,105 @@ async def _send_report(message: Message, date_from: date, date_to: date) -> None
             BufferedInputFile(bundle.chart_top_sku_png, filename="top_sku.png"),
             caption="Топ товаров",
         )
+
+
+async def _send_bundle(message: Message, bundle, name_suffix: str) -> None:
+    date_from, date_to = bundle.period
+    await message.answer(format_summary_text(date_from, date_to, bundle))
+    await message.answer_document(
+        BufferedInputFile(bundle.excel, filename=f"wb_report_{name_suffix}.xlsx"),
+        caption="Полный отчёт с детализацией",
+    )
+    if bundle.chart_breakdown_png:
+        await message.answer_photo(
+            BufferedInputFile(bundle.chart_breakdown_png, filename="breakdown.png"),
+            caption="Расшифровка по статьям",
+        )
+    if bundle.chart_top_sku_png:
+        await message.answer_photo(
+            BufferedInputFile(bundle.chart_top_sku_png, filename="top_sku.png"),
+            caption="Топ товаров",
+        )
+
+
+def _format_report_button(meta: ReportMeta) -> str:
+    df = meta.date_from.replace("-", ".") if meta.date_from else "—"
+    dt = meta.date_to.replace("-", ".") if meta.date_to else "—"
+    return f"№{meta.id} · {df} — {dt}"
+
+
+def _reports_keyboard(items: list[ReportMeta]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=_format_report_button(m), callback_data=f"rpt:{m.id}")]
+        for m in items
+    ]
+    rows.append(
+        [InlineKeyboardButton(text="🔄 Обновить список из WB", callback_data="rpt:refresh")]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _show_reports_list(message: Message, *, force_refresh: bool) -> None:
+    items = list_reports_sorted()
+    if not items or force_refresh:
+        try:
+            token = get_wb_token()
+        except NoWBTokenError as exc:
+            await message.answer(str(exc))
+            return
+        status = await message.answer(
+            "Тяну список фин-отчётов за 35 дней из WB (учитываю лимит ~1 req/min)…"
+        )
+        try:
+            await refresh_reports_index(token, before_wb_call=_wait_for_wb_window)
+        except WBApiError as exc:
+            text = str(exc)
+            if "429" in text:
+                await status.edit_text(
+                    "WB API ограничивает реализационный отчёт до 1 запроса в минуту. "
+                    "Подождите и попробуйте ещё раз."
+                )
+            else:
+                await status.edit_text(f"Ошибка WB API: {exc}")
+            return
+        items = list_reports_sorted()
+        if not items:
+            await status.edit_text("За последние 35 дней WB не вернул фин-отчётов.")
+            return
+        await status.delete()
+
+    await message.answer(
+        f"<b>Доступные фин-отчёты ({len(items)}):</b>\nНажмите на нужный, чтобы получить расшифровку.",
+        reply_markup=_reports_keyboard(items),
+    )
+
+
+async def _send_report_by_id(message: Message, report_id: str) -> None:
+    items = list_reports_sorted()
+    pos = next((i for i, m in enumerate(items) if m.id == report_id), None)
+    if pos is None:
+        await message.answer("Этот отчёт больше не в индексе. Нажмите «🔄 Обновить список из WB».")
+        return
+    curr = items[pos]
+    prev = items[pos + 1] if pos + 1 < len(items) else None
+
+    rows_curr = get_report_rows(curr.id)
+    rows_prev = get_report_rows(prev.id) if prev else None
+
+    bundle = build_bundle_from_rows(
+        rows_curr,
+        period=(date.fromisoformat(curr.date_from), date.fromisoformat(curr.date_to)),
+        previous_rows=rows_prev,
+        previous_period=(
+            (date.fromisoformat(prev.date_from), date.fromisoformat(prev.date_to))
+            if prev
+            else None
+        ),
+    )
+    if bundle.rows_count == 0:
+        await message.answer(f"Отчёт №{curr.id} пуст.")
+        return
+    await _send_bundle(message, bundle, name_suffix=f"{curr.id}_{curr.date_from}_{curr.date_to}")
 
 
 async def run_polling() -> None:
