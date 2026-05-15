@@ -488,7 +488,7 @@ def build_dispatcher() -> Dispatcher:
         # 2) Иначе пробуем как реализационный отчёт WB (русские шапки).
         status = await message.answer("Разбираю WB-отчёт из Excel…")
         try:
-            rows = parse_wb_excel(content)
+            rows = parse_wb_excel(content, filename=doc.file_name)
         except ValueError as exc:
             await status.edit_text(
                 "Не понял формат файла. Если это файл с себестоимостью — "

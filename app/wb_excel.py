@@ -90,7 +90,19 @@ def _detect_header_row(raw: pd.DataFrame, look_rows: int = 15) -> int:
     raise ValueError("Не нашёл шапку таблицы в Excel.")
 
 
-def parse_wb_excel(content: bytes) -> list[dict]:
+FNAME_REPORT_RE = re.compile(r"№?\s*(\d{6,12})_(\d{3,12})")
+
+
+def _report_id_from_filename(filename: str | None) -> int | None:
+    if not filename:
+        return None
+    m = FNAME_REPORT_RE.search(filename)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def parse_wb_excel(content: bytes, filename: str | None = None) -> list[dict]:
     bio = BytesIO(content)
     raw = pd.read_excel(bio, engine="openpyxl", header=None)
     header_row = _detect_header_row(raw)
@@ -142,10 +154,18 @@ def parse_wb_excel(content: bytes) -> list[dict]:
             for k in ("date_from", "date_to"):
                 v = row_dict.get(k)
                 if isinstance(v, str) and len(v) >= 10:
-                    # сначала пробуем как есть, иначе через pandas
                     try:
                         row_dict[k] = pd.to_datetime(v, dayfirst=True).date().isoformat()
                     except Exception:  # noqa: BLE001
                         row_dict[k] = v[:10]
             out.append(row_dict)
+
+    # Если внутри файла не оказалось номера отчёта — вытащим его из имени файла
+    # вида "Еженедельный детализированный отчет №713836250_1344375 - 1.xlsx".
+    has_id = any(r.get("realizationreport_id") for r in out)
+    if not has_id:
+        rid = _report_id_from_filename(filename)
+        if rid is not None:
+            for r in out:
+                r["realizationreport_id"] = rid
     return out
