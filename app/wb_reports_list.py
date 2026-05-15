@@ -78,9 +78,9 @@ def _build_index(rows: list[dict]) -> dict:
         )
         # На случай если у первой строки даты пустые — берём из любой следующей
         if not bucket["date_from"] and r.get("date_from"):
-            bucket["date_from"] = r["date_from"][:10]
+            bucket["date_from"] = str(r["date_from"])[:10]
         if not bucket["date_to"] and r.get("date_to"):
-            bucket["date_to"] = r["date_to"][:10]
+            bucket["date_to"] = str(r["date_to"])[:10]
         bucket["rows"].append(r)
     return by_id
 

@@ -678,6 +678,18 @@ async def _refresh_reports_from_wb(message: Message) -> None:
     )
 
 
+def _safe_iso_date(s: str | None, default: date | None = None) -> date:
+    if not s:
+        return default or date.today()
+    try:
+        return date.fromisoformat(s)
+    except ValueError:
+        try:
+            return date.fromisoformat(s[:10])
+        except ValueError:
+            return default or date.today()
+
+
 async def _send_report_by_id(message: Message, report_id: str) -> None:
     items = list_reports_sorted()
     pos = next((i for i, m in enumerate(items) if m.id == report_id), None)
@@ -690,15 +702,22 @@ async def _send_report_by_id(message: Message, report_id: str) -> None:
     rows_curr = get_report_rows(curr.id)
     rows_prev = get_report_rows(prev.id) if prev else None
 
+    curr_period = (_safe_iso_date(curr.date_from), _safe_iso_date(curr.date_to))
+    prev_period: tuple[date, date] | None = None
+    if prev and prev.date_from and prev.date_to:
+        try:
+            prev_period = (
+                _safe_iso_date(prev.date_from),
+                _safe_iso_date(prev.date_to),
+            )
+        except Exception:  # noqa: BLE001
+            prev_period = None
+
     bundle = build_bundle_from_rows(
         rows_curr,
-        period=(date.fromisoformat(curr.date_from), date.fromisoformat(curr.date_to)),
+        period=curr_period,
         previous_rows=rows_prev,
-        previous_period=(
-            (date.fromisoformat(prev.date_from), date.fromisoformat(prev.date_to))
-            if prev
-            else None
-        ),
+        previous_period=prev_period,
     )
     if bundle.rows_count == 0:
         await message.answer(f"Отчёт №{curr.id} пуст.")
